@@ -1,0 +1,210 @@
+---
+title: "Predicting Activity Type"
+author: "Rayyan Jaber"
+date: "April 20, 2016"
+output: html_document
+---
+
+## Summary 
+
+The goal of this paper is to predict the manner in which subjects exercise
+barbell lifts based on sensor measurements. There are 6 subjects and 5 different ways of exercise: one is correct and the other 4 are not. To do, we first clean the data from NA values, removing columns that are not helpful in performing predictions on test dataset. We then split the given training dataset (19622 rows) into two: 75% training dataset (14718 rows) and 25% cross validation set (4904 rows). We apply three classification algorithms: linear discriminant anaylsis, generalized boosting model and random forest and compare their in sample error rate and out of sample error rate. The random forest predictor ends up being by far the most accurate predictor on the cross validation dataset with an estimated out of sample accuracy of 99.45% (95% confidence interval [99.2%, 99.64%]) compared to linear discriminant analysis predictor's out of sample accuracy of 73.76% and generalized boosting model's out of sample accuracy of 48.21%. Equivalently, out of sample error rate of random forest predictor is 100 - 99.45 = 0.55% (95% confidence interval is [0.36%, 0.80%]). We then use the random forest predictor to predict the testing data set.
+
+The data was made available from this project: http://groupware.les.inf.puc-rio.br/har
+and we thank the authors for generously allowing us to use it in this analysis. More information is available about the data from the website: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+## Reading Data: Training, Cross Validation and Testing
+
+- We use the `read.csv` method to read the training and testing dataset from the website.
+
+- The data was made available from this project: http://groupware.les.inf.puc-rio.br/har
+and we thank the authors for generously allowing us to use it in this analysis. More information is available about the data from the website: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+- We merge the two dataset into one so that we can apply the same data pre-processing steps to both data sets at once. Of course, we will not use data from the testing data set until after the prediction model has been established otherwise our results will be biased.
+
+```{r, message=FALSE}
+trainingCsv <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testingCsv <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+trainingAll <- trainingCsv
+testing <- testingCsv
+
+trainingAll$problem_id = NA
+trainingAll$dataset = "Training"
+
+testing$classe = NA
+testing$dataset = "Testing"
+```
+
+We then split the training dataset that we have so that 75% of the rows are training and we use the remaining 25% for cross validation:
+
+```{r, message=FALSE}
+library(caret)
+library(dplyr)
+library(gbm)
+library(randomForest)
+
+set.seed(0)
+
+inTrain <- createDataPartition(y=trainingAll$classe, p=0.75, list=FALSE)
+trainingAll[-inTrain,]$dataset <- "CrossValidation"
+
+dataAll <- rbind(trainingAll, testing)
+dataAll$dataset <- factor(dataAll$dataset)
+```
+
+- We end up with a tidy data set that contains `r nrow(dataAll)` and `r ncol(dataAll)`, with `r nrow(trainingAll[inTrain,])` rows in training dataset and `r nrow(trainingAll[-inTrain,])` in cross validation.
+
+## Exploratory Data Analysis and Preprocessing
+
+There are many columns that are provided in the training and testing datasets and there are many NA values.
+
+We need to impute those values before passing them to the classification algorithms.
+
+When we explore the data in the testing dataset, we realize that there are many columns where all the values are missing. Inspecting them manually, we observe these are the aggregate statistics in a window (such as amplitude, average, variance, min, max, etc.). There's no point in using those columns in our predictor model because we don't have values for those in any of our testing dataset. So we excluse those columns from our training dataset.
+
+```{r, message=FALSE}
+# There are many columns that are not provided in the testing data
+# If those columns are not provided in testing data, there's no point in using 
+# them as predictors. 
+indicesAllNAInTesting <- sapply(testing, function(x) all(is.na(x)))
+columnsNotAllNA <- names(indicesAllNAInTesting)[!indicesAllNAInTesting]
+
+# Note: we retain the classe column even though all its values are na
+# in the test data, because we definitely need this column for training
+# and cross validation
+dataAll <- dataAll[, c(columnsNotAllNA, "classe")]
+```
+
+The num_window variable corresponds to a window of time when the sequence of 
+measurements were made. When we look at the testing dataset, we notice that the
+number of rows in the test dataset that share the same window is zero:
+
+```{r}
+length(unique(dataAll[dataAll$dataset == "Testing",]$num_window))
+```
+
+As such, given that in our test dataset, each row will be from a different window,
+we can't use window/timing information in our prediction model, so we remove time columns (timestamp columns and window column):
+
+```{r, message=FALSE}
+# They are all in different windows, so no point in using the timing information
+timingRelatedIndices <- grep("timestamp|window", names(dataAll))
+dataAll <- dataAll[, -timingRelatedIndices]
+
+# Set aside the testing data set.
+testing <- dataAll %>% filter(dataset == "Testing")
+
+# From training and cross validation data sets, the columns
+# X (unique ID of a row), dataset type (all values will be training), 
+# and problem_id (all values for problem_id are NA's in training dataset)
+# are useless, so we also excluse them.
+training <- dataAll %>% filter(dataset == "Training")
+training <- training[,-grep("problem_id|dataset|X", names(training))]
+
+# Apply same in cross validation dataset
+crossValidation <- dataAll %>% filter(dataset == "CrossValidation")
+crossValidation <- crossValidation[,-grep("problem_id|dataset|X", names(crossValidation))]
+```
+
+The number of columns that remain in our tidy set is: `r ncol(training)`. This is manageable. The number of NA values is 0:
+
+```{r}
+sum(is.na(training))
+```
+
+Names of the columns used for training:
+```{r}
+names(training)
+```
+
+## Prediction Models
+
+We then construct three prediction models: linear discriminant analysis, generalized boosting model and random forest and we compare the in sample and out of sample errors for each model.
+
+```{r, message=FALSE}
+modelLda <- train(classe ~ ., preProcess=c("center", "scale"), data = training, method = "lda")
+modelGbm <- gbm(classe ~ ., data = training, n.trees = 100)
+modelRf <- randomForest(classe ~ ., data = training)
+
+
+trainingNoAnswer <- training[,-grep("classe", names(training))]
+
+predictorTrainingLda <- predict(modelLda, trainingNoAnswer)
+
+predictorTrainingGbm <- predict(modelGbm, trainingNoAnswer, type="response", n.trees = 100)
+predictorTrainingGbm <- dimnames(predictorTrainingGbm)[[2]][apply(predictorTrainingGbm, 1, which.max)]
+
+predictorTrainingRf <- predict(modelRf, trainingNoAnswer)
+```
+
+### Accuracy in Training Data
+
+We calculate accuracy rate in training dataset and the error rate. Note: error rate is just 100% - accuracy rate.
+
+```{r, message=FALSE}
+# In sample accuracy
+inSampleAccuracyLda = sum(predictorTrainingLda == training$classe) * 100 / length(training$classe)
+inSampleAccuracyGbm = sum(predictorTrainingGbm == training$classe) * 100 / length(training$classe)
+inSampleAccuracyRf = sum(predictorTrainingRf == training$classe) * 100 / length(training$classe)
+
+inSampleAccuracy = data.frame(lda = inSampleAccuracyLda, gbm = inSampleAccuracyGbm, rf = inSampleAccuracyRf)
+inSampleAccuracy
+
+# error rate is 100% - accuracy
+inSampleErrorRate = 100 - inSampleAccuracy
+inSampleErrorRate
+```
+
+The random forest predictor was able to fit the training set perfectly resulting in a training error of 0%, compared to the much higher error rates form lda (26.55%) and gbm (51.10%) predictors.
+
+The figure below shows the error in training dataset in the random forest model vs. the number of trees used when consructing the model. The figure shows that as we increase the number of trees and hence the parameters of the model, the error rate decreases. At 500 trees, the number of trees in training dataset goes to zero.
+
+A very low error in training dataset is not very meaningful by itself, because we could be fitting noise. The in sample accuracy is not good indication though of the performance of a predictor. We should consider the out of sample accuracy and error rate when evaluating the performance of a classifier.
+
+```{r}
+plot(modelRf)
+```
+
+### Accuracy in Cross Validation Dataset
+
+```{r, message=FALSE}
+crossValidationNoAnswer = crossValidation[, names(crossValidation) != "classe"]
+
+predictorCrossValidationLda <- predict(modelLda, crossValidationNoAnswer)
+predictorCrossValidationGbm <- predict(modelGbm, crossValidationNoAnswer, n.trees = 100)
+predictorCrossValidationGbm <- dimnames(predictorCrossValidationGbm)[[2]][apply(predictorCrossValidationGbm, 1, which.max)]
+predictorCrossValidationRf <- predict(modelRf, crossValidationNoAnswer)
+
+# Out of sample accuracy
+outSampleAccuracyLda = sum(predictorCrossValidationLda == crossValidation$classe) * 100 / length(crossValidation$classe)
+outSampleAccuracyGbm = sum(predictorCrossValidationGbm == crossValidation$classe) * 100 / length(crossValidation$classe)
+outSampleAccuracyRf = sum(predictorCrossValidationRf == crossValidation$classe) * 100 / length(crossValidation$classe)
+
+outSampleAccuracy = data.frame(lda = outSampleAccuracyLda, gbm = outSampleAccuracyGbm, rf = outSampleAccuracyRf)
+outSampleAccuracy
+
+outSampleErrorRate = 100 - outSampleAccuracy
+outSampleErrorRate
+```
+
+The out of sample accuracy of random forest is 99.45% and is significantly better than the accuracy rate of the lda (73.75%) and gbm (48.21%).
+
+Given that random forest predictor resulted in best accuracy rate on out of sample data, then we will choose the predictor.
+
+**The estimated out of sample error rate for random forest predictor is 100% - 99.45% = 0.55%, which is a very low error rate.**
+
+We also look at the confusion matrix, sensitivity and specifity is great (higher than 99%) across all levels of the classe output. The overall accuracy rate has a 95% confidence interval of [99.2%, 99.64%].
+
+```{r}
+confusionMatrix(predictorCrossValidationRf, crossValidation$classe)
+```
+
+## Predicting outcomes on testing dataset
+We use the random forest model to predict outcome on testing dataset:
+
+```{r, message=FALSE}
+testing <- dataAll %>% filter(dataset == "Testing")
+predictorTestingRf <- predict(modelRf, testing)
+predictorTestingRf
+```
